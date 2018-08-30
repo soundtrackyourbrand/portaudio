@@ -569,9 +569,8 @@ static void PaAlsa_CloseLibrary()
             { \
                 PaUtil_SetLastHostErrorInfo( paALSA, __pa_unsure_error_id, alsa_snd_strerror( __pa_unsure_error_id ) ); \
             } \
-            PaUtil_DebugPrint( "Expression '" #expr "' failed in '" __FILE__ "', line: " STRINGIZE( __LINE__ ) "\n" ); \
-            if( (code) == paUnanticipatedHostError ) \
-                PA_DEBUG(( "Host error description: %s\n", alsa_snd_strerror( __pa_unsure_error_id ) )); \
+            PaUtil_DebugPrint( "Expression '" #expr "' failed in '" __FILE__ "', line: " STRINGIZE( __LINE__ ) " error_id: %d code: %d\n", __pa_unsure_error_id, code ); \
+            PA_DEBUG(( "Host error description: %s\n", alsa_snd_strerror( __pa_unsure_error_id ) )); \
             result = (code); \
             goto error; \
         } \
@@ -1139,6 +1138,8 @@ static int OpenPcm( snd_pcm_t **pcmp, const char *name, snd_pcm_stream_t stream,
     }
     else
     {
+        // THIS HAPPENS HERE
+        //  OpenPcm: Opened device 'hw:15,0' ptr[(nil)] - result: [-2:No such file or directory]
         if( ret < 0 )
             PA_DEBUG(( "%s: Opened device '%s' ptr[%p] - result: [%d:%s]\n", __FUNCTION__, name, *pcmp, ret, alsa_snd_strerror(ret) ));
     }
@@ -1726,12 +1727,17 @@ static PaError AlsaOpen( const PaUtilHostApiRepresentation *hostApi, const PaStr
     else
         deviceName = streamInfo->deviceString;
 
+
+    // AlsaOpen: Opening device hw:15,
+    // ALSA lib pcm_hw.c:1713:(_snd_pcm_hw_open) Invalid value for card
+    // OpenPcm: Opened device 'hw:15,0' ptr[(nil)] - result: [-2:No such file or directory]
     PA_DEBUG(( "%s: Opening device %s\n", __FUNCTION__, deviceName ));
     if( (ret = OpenPcm( pcm, deviceName, streamDir == StreamDirection_In ? SND_PCM_STREAM_CAPTURE : SND_PCM_STREAM_PLAYBACK,
                     SND_PCM_NONBLOCK, 1 )) < 0 )
     {
         /* Not to be closed */
         *pcm = NULL;
+        // THIS HAPPENS HERE
         ENSURE_( ret, -EBUSY == ret ? paDeviceUnavailable : paBadIODeviceCombination );
     }
     ENSURE_( alsa_snd_pcm_nonblock( *pcm, 0 ), paUnanticipatedHostError );
@@ -1764,6 +1770,8 @@ static PaError TestParameters( const PaUtilHostApiRepresentation *hostApi, const
     else
         numHostChannels = parameters->channelCount;
 
+    // HERE
+    // Expression 'AlsaOpen( hostApi, parameters, streamDir, &pcm )' failed in 'src/hostapi/alsa/pa_linux_alsa.c', line: 1767
     PA_ENSURE( AlsaOpen( hostApi, parameters, streamDir, &pcm ) );
 
     alsa_snd_pcm_hw_params_any( pcm, hwParams );
@@ -1900,7 +1908,12 @@ static PaError PaAlsaStreamComponent_Initialize( PaAlsaStreamComponent *self, Pa
     self->device = params->device;
 
     PA_ENSURE( AlsaOpen( &alsaApi->baseHostApiRep, params, streamDir, &self->pcm ) );
+
+    // This fails to happen
     self->nfds = alsa_snd_pcm_poll_descriptors_count( self->pcm );
+
+    // Added by me
+    assert(self->nfds > 0);
 
     PA_ENSURE( hostSampleFormat = PaUtil_SelectClosestAvailableFormat( GetAvailableFormats( self->pcm ), userSampleFormat ) );
 
@@ -2135,6 +2148,7 @@ static PaError PaAlsaStream_Initialize( PaAlsaStream *self, PaAlsaHostApiReprese
 {
     PaError result = paNoError;
     assert( self );
+    assert(inParams || outParams);
 
     memset( self, 0, sizeof( PaAlsaStream ) );
 
@@ -2170,7 +2184,12 @@ static PaError PaAlsaStream_Initialize( PaAlsaStream *self, PaAlsaHostApiReprese
         PA_ENSURE( PaAlsaStreamComponent_Initialize( &self->playback, alsaApi, outParams, StreamDirection_Out, NULL != callback ) );
     }
 
-    assert( self->capture.nfds || self->playback.nfds );
+    // THIS is the assert that blows
+    // soundcrit_executable: src/hostapi/alsa/pa_linux_alsa.c:2173: PaAlsaStream_Initialize: Assertion `self->capture.nfds || self->playback.nfds' failed.
+    if (!( self->capture.nfds || self->playback.nfds )) {
+      result = paUnanticipatedHostError;
+      goto error;
+    };
 
     PA_UNLESS( self->pfds = (struct pollfd*)PaUtil_AllocateMemory( ( self->capture.nfds +
                     self->playback.nfds ) * sizeof( struct pollfd ) ), paInsufficientMemory );
@@ -2808,6 +2827,11 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
     if( ( streamFlags & paPlatformSpecificFlags ) != 0 )
         return paInvalidFlag;
 
+    if (!inputParameters && !outputParameters) {
+      result = paInvalidDevice;
+      goto error;
+    }
+
     if( inputParameters )
     {
         PA_ENSURE( ValidateParameters( inputParameters, hostApi, StreamDirection_In ) );
@@ -2831,6 +2855,8 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
     }
 
     PA_UNLESS( stream = (PaAlsaStream*)PaUtil_AllocateMemory( sizeof(PaAlsaStream) ), paInsufficientMemory );
+
+    // HERE is the stack
     PA_ENSURE( PaAlsaStream_Initialize( stream, alsaHostApi, inputParameters, outputParameters, sampleRate,
                 framesPerBuffer, callback, streamFlags, userData ) );
 
